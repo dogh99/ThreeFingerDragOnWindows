@@ -1,4 +1,4 @@
-name: Build upstream Windows x64
+name: Build upstream Windows x64 (signed)
 on: workflow_dispatch
 
 permissions:
@@ -24,7 +24,7 @@ jobs:
         with:
           msbuild-architecture: x64
 
-      - name: Build unsigned Windows 11 test package
+      - name: Build and sign Windows x64 test package
         id: package
         shell: pwsh
         run: |
@@ -35,7 +35,8 @@ jobs:
           $xml = [xml](Get-Content -LiteralPath $manifest -Raw)
           $identity = $xml.DocumentElement.SelectSingleNode("*[local-name()='Identity']")
           if (-not $identity) { throw 'Package Identity not found.' }
-          $identity.SetAttribute('Publisher', 'CN=ThreeFingerDragOnWindows Test, OID.2.25.311729368913984317654407730594956997722=1')
+          $publisher = 'CN=ThreeFingerDragOnWindows Personal Test Build'
+          $identity.SetAttribute('Publisher', $publisher)
           $xml.Save($manifest)
 
           $out = Join-Path $env:RUNNER_TEMP 'msix-output'
@@ -54,12 +55,23 @@ jobs:
             Where-Object { $_.FullName -notmatch '[\\/]Dependencies[\\/]' })
           if ($packages.Count -eq 0) { throw 'No application MSIX was produced.' }
 
+          $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -File |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signTool) { throw 'Windows SDK SignTool was not found.' }
+
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $publisher -CertStoreLocation 'Cert:\CurrentUser\My' -KeyExportPolicy NonExportable
+          foreach ($pkg in $packages) {
+            & $signTool.FullName sign /fd SHA256 /sha1 $cert.Thumbprint $pkg.FullName
+            if ($LASTEXITCODE -ne 0) { throw "SignTool failed: $LASTEXITCODE" }
+          }
+          Export-Certificate -Cert $cert -FilePath (Join-Path $out 'ThreeFingerDrag-Test.cer') | Out-Null
+
           Set-Content -LiteralPath (Join-Path $out 'source-commit.txt') -Value $sha
           "sha=$($sha.Substring(0,12))" >> $env:GITHUB_OUTPUT
 
       - name: Upload MSIX and dependencies
         uses: actions/upload-artifact@v4
         with:
-          name: ThreeFingerDrag-x64-${{ steps.package.outputs.sha }}
+          name: ThreeFingerDrag-signed-x64-${{ steps.package.outputs.sha }}
           path: ${{ runner.temp }}/msix-output/
           if-no-files-found: error
