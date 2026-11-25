@@ -1,0 +1,65 @@
+name: Build upstream Windows x64
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+    steps:
+      - name: Checkout upstream main
+        uses: actions/checkout@v6
+        with:
+          repository: ClementGre/ThreeFingerDragOnWindows
+          ref: refs/heads/main
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+
+      - name: Build unsigned Windows 11 test package
+        id: package
+        shell: pwsh
+        run: |
+          $sha = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve upstream commit.' }
+
+          $manifest = Join-Path $PWD 'ThreeFingerDragOnWindows/Package.appxmanifest'
+          $xml = [xml](Get-Content -LiteralPath $manifest -Raw)
+          $identity = $xml.DocumentElement.SelectSingleNode("*[local-name()='Identity']")
+          if (-not $identity) { throw 'Package Identity not found.' }
+          $identity.SetAttribute('Publisher', 'CN=ThreeFingerDragOnWindows Test, OID.2.25.311729368913984317654407730594956997722=1')
+          $xml.Save($manifest)
+
+          $out = Join-Path $env:RUNNER_TEMP 'msix-output'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+
+          $buildArgs = @(
+            '.\ThreeFingerDragOnWindows.sln', '/restore', '/m', '/t:Build',
+            '/p:Configuration=Release', '/p:Platform=x64',
+            '/p:RuntimeIdentifier=win-x64', '/p:GenerateAppxPackageOnBuild=true',
+            '/p:AppxBundle=Never', '/p:UapAppxPackageBuildMode=SideloadOnly',
+            '/p:AppxPackageSigningEnabled=false', "/p:AppxPackageDir=$out/"
+          )
+          & msbuild @buildArgs
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed: $LASTEXITCODE" }
+          $packages = @(Get-ChildItem -LiteralPath $out -Recurse -Filter '*.msix' -File |
+            Where-Object { $_.FullName -notmatch '[\\/]Dependencies[\\/]' })
+          if ($packages.Count -eq 0) { throw 'No application MSIX was produced.' }
+
+          Set-Content -LiteralPath (Join-Path $out 'source-commit.txt') -Value $sha
+          "sha=$($sha.Substring(0,12))" >> $env:GITHUB_OUTPUT
+
+      - name: Upload MSIX and dependencies
+        uses: actions/upload-artifact@v4
+        with:
+          name: ThreeFingerDrag-x64-${{ steps.package.outputs.sha }}
+          path: ${{ runner.temp }}/msix-output/
+          if-no-files-found: error
